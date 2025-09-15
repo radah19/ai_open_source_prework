@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MMORPG World Viewer</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <canvas id="world-canvas" aria-label="World map canvas"></canvas>
+
+    <script>
+      (function () {
+        const canvas = document.getElementById('world-canvas');
+        const ctx = canvas.getContext('2d');
+
+        // World image
+        const worldImage = new Image();
+        worldImage.src = 'world.jpg';
+
+        // Avatar image cache: url -> HTMLImageElement
+        const imageCache = new Map();
+
+        // Connection
+        const WS_URL = 'wss://codepath-mmorg.onrender.com';
+        let socket = null;
+
+        // Game state
+        const state = {
+          world: { width: 2048, height: 2048 }, // default; will clamp via image dims when loaded
+          me: null, // { id, x, y, username, avatarKey, facing, frame }
+          players: {}, // id -> { id, x, y, username, avatarKey, facing, frame }
+          avatars: {}, // name -> { frames: { north:[], south:[], east:[] } }
+          viewport: { x: 0, y: 0 },
+          devicePixelRatio: window.devicePixelRatio || 1
+        };
+
+        // Input tracking
+        const activeKeys = new Set();
+
+        function connect() {
+          try {
+            socket = new WebSocket(WS_URL);
+          } catch (e) {
+            console.error('WebSocket init failed', e);
+            return;
+          }
+
+          socket.addEventListener('open', function () {
+            // Join without avatar - let server provide default
+            const joinMsg = { action: 'join_game', username: 'Anuj' };
+            socket.send(JSON.stringify(joinMsg));
+          });
+
+          socket.addEventListener('message', function (event) {
+            try {
+              const msg = JSON.parse(event.data);
+              handleServerMessage(msg);
+            } catch (e) {
+              console.warn('Invalid message', event.data);
+            }
+          });
+
+          socket.addEventListener('close', function () {
+            // Optional: reconnect strategy
+          });
+
+          socket.addEventListener('error', function (e) {
+            console.error('WebSocket error', e);
+          });
+        }
+
+        function handleServerMessage(msg) {
+          console.log('Received message:', msg);
+          if (msg.action === 'join_game' && msg.success) {
+            console.log('Join game success, avatars:', msg.avatars);
+            console.log('Players:', msg.players);
+            console.log('PlayerId:', msg.playerId);
+            state.avatars = msg.avatars || {};
+            // Store all players
+            if (msg.players) {
+              state.players = msg.players;
+            }
+            // Determine my player from players map
+            const meId = msg.playerId;
+            const me = (msg.players && msg.players[meId]) || null;
+            if (me) {
+              console.log('My player data:', me);
+              state.me = {
+                id: me.id,
+                x: me.x,
+                y: me.y,
+                username: me.username || 'Anuj',
+                avatarKey: me.avatar,
+                facing: me.facing || 'south',
+                frame: me.animationFrame || 0
+              };
+              console.log('My avatar key:', state.me.avatarKey);
+              console.log('Available avatars:', Object.keys(state.avatars));
+              // Preload my avatar frames
+              preloadAvatarImages(state.me.avatarKey);
+            }
+          } else if (msg.action === 'player_joined') {
+            // Add new player
+            if (msg.player) {
+              state.players[msg.player.id] = {
+                id: msg.player.id,
+                x: msg.player.x,
+                y: msg.player.y,
+                username: msg.player.username,
+                avatarKey: msg.player.avatar,
+                facing: msg.player.facing || 'south',
+                frame: msg.player.animationFrame || 0
+              };
+              // Preload new player's avatar frames
+              preloadAvatarImages(msg.player.avatar);
+            }
+            // Add new avatar data
+            if (msg.avatar) {
+              state.avatars[msg.avatar.name] = msg.avatar;
+            }
+          } else if (msg.action === 'players_moved' && msg.players) {
+            // Update all moved players
+            Object.keys(msg.players).forEach(playerId => {
+              const updatedPlayer = msg.players[playerId];
+              if (state.players[playerId]) {
+                state.players[playerId].x = updatedPlayer.x;
+                state.players[playerId].y = updatedPlayer.y;
+                state.players[playerId].facing = updatedPlayer.facing;
+                state.players[playerId].frame = updatedPlayer.animationFrame;
+                
+                // Also update state.me if this is our player
+                if (state.me && state.me.id === playerId) {
+                  state.me.x = updatedPlayer.x;
+                  state.me.y = updatedPlayer.y;
+                  state.me.facing = updatedPlayer.facing;
+                  state.me.frame = updatedPlayer.animationFrame;
+                }
+              }
+            });
+          } else if (msg.action === 'player_left') {
+            // Remove player
+            if (msg.playerId && state.players[msg.playerId]) {
+              delete state.players[msg.playerId];
+            }
+          } else if (msg.success === false && msg.error) {
+            console.error('Server error:', msg.error);
+          }
+        }
+
+        function preloadAvatarImages(avatarKey) {
+          console.log('preloadAvatarImages called for:', avatarKey);
+          const avatarDef = state.avatars && state.avatars[avatarKey];
+          console.log('Avatar def for preload:', avatarDef);
+          if (!avatarDef || !avatarDef.frames) {
+            console.log('No avatar def or frames for preload:', avatarKey);
+            return;
+          }
+          ['north', 'south', 'east'].forEach(function (dir) {
+            const arr = avatarDef.frames[dir] || [];
+            console.log('Preloading frames for direction:', dir, 'count:', arr.length);
+            arr.forEach(function (url) {
+              if (!imageCache.has(url)) {
+                console.log('Loading image:', url);
+                const img = new Image();
+                img.src = url;
+                imageCache.set(url, img);
+              }
+            });
+          });
+        }
+
+        function resizeCanvas() {
+          const pixelRatio = window.devicePixelRatio || 1;
+          state.devicePixelRatio = pixelRatio;
+
+          const widthCss = window.innerWidth;
+          const heightCss = window.innerHeight;
+
+          canvas.width = Math.floor(widthCss * pixelRatio);
+          canvas.height = Math.floor(heightCss * pixelRatio);
+          canvas.style.width = widthCss + 'px';
+          canvas.style.height = heightCss + 'px';
+        }
+
+        function computeViewport() {
+          const worldWidth = worldImage.naturalWidth || state.world.width;
+          const worldHeight = worldImage.naturalHeight || state.world.height;
+
+          const viewWidth = canvas.width; // in device pixels
+          const viewHeight = canvas.height;
+
+          if (!state.me) {
+            state.viewport.x = 0;
+            state.viewport.y = 0;
+            return;
+          }
+
+          const centerX = Math.floor(state.me.x - viewWidth / 2);
+          const centerY = Math.floor(state.me.y - viewHeight / 2);
+
+          const maxX = Math.max(0, worldWidth - viewWidth);
+          const maxY = Math.max(0, worldHeight - viewHeight);
+
+          state.viewport.x = Math.min(Math.max(0, centerX), maxX);
+          state.viewport.y = Math.min(Math.max(0, centerY), maxY);
+          
+          // Debug viewport
+          console.log('Viewport update - me:', state.me.x, state.me.y, 'viewport:', state.viewport.x, state.viewport.y);
+        }
+
+        function drawLabel(text, x, y) {
+          ctx.font = '16px sans-serif';
+          ctx.textBaseline = 'bottom';
+          ctx.textAlign = 'center';
+          const padding = 4;
+          const metrics = ctx.measureText(text);
+          const textWidth = Math.ceil(metrics.width);
+          const textHeight = 16; // approximate
+          const rectX = Math.round(x - textWidth / 2 - padding);
+          const rectY = Math.round(y - textHeight - 8 - padding);
+          const rectW = Math.round(textWidth + padding * 2);
+          const rectH = Math.round(textHeight + padding * 2);
+
+          ctx.fillStyle = 'rgba(0,0,0,0.6)';
+          ctx.fillRect(rectX, rectY, rectW, rectH);
+          ctx.fillStyle = '#ffffff';
+          ctx.fillText(text, x, rectY + rectH - padding);
+        }
+
+        function selectAvatarFrame(me) {
+          console.log('selectAvatarFrame called for:', me.username, 'avatarKey:', me.avatarKey);
+          console.log('state.avatars:', state.avatars);
+          console.log('Looking for avatar:', me.avatarKey);
+          console.log('Available avatar keys:', Object.keys(state.avatars || {}));
+          console.log('Avatar key type:', typeof me.avatarKey);
+          console.log('Available keys types:', Object.keys(state.avatars || {}).map(k => typeof k));
+          
+          const avatarDef = state.avatars && state.avatars[me.avatarKey];
+          console.log('Found avatarDef:', avatarDef);
+          
+          if (!avatarDef || !avatarDef.frames) {
+            console.log('No avatar def for:', me.avatarKey, 'avatars:', Object.keys(state.avatars));
+            
+            // Try to find any available avatar as fallback
+            const availableKeys = Object.keys(state.avatars || {});
+            if (availableKeys.length > 0) {
+              console.log('Trying fallback avatar:', availableKeys[0]);
+              const fallbackDef = state.avatars[availableKeys[0]];
+              if (fallbackDef && fallbackDef.frames) {
+                console.log('Using fallback avatar:', availableKeys[0]);
+                // Continue with fallback avatar
+                const fallbackFrames = fallbackDef.frames[me.facing] || fallbackDef.frames['south'] || [];
+                if (fallbackFrames.length > 0) {
+                  const idx = Math.max(0, Math.min(fallbackFrames.length - 1, me.frame || 0));
+                  const url = fallbackFrames[idx];
+                  const img = imageCache.get(url);
+                  return img ? { img, shouldFlip: me.facing === 'west' } : null;
+                }
+              }
+            }
+            return null;
+          }
+          
+          let dirFrames;
+          let shouldFlip = false;
+          
+          if (me.facing === 'west') {
+            // West uses flipped east frames
+            dirFrames = avatarDef.frames['east'] || [];
+            shouldFlip = true;
+          } else {
+            dirFrames = avatarDef.frames[me.facing] || avatarDef.frames['south'] || [];
+          }
+          
+          if (!dirFrames.length) {
+            console.log('No frames for direction:', me.facing, 'available:', Object.keys(avatarDef.frames));
+            return null;
+          }
+          const idx = Math.max(0, Math.min(dirFrames.length - 1, me.frame || 0));
+          const url = dirFrames[idx];
+          const img = imageCache.get(url);
+          
+          if (!img) {
+            console.log('Image not in cache for URL:', url);
+          }
+          
+          return img ? { img, shouldFlip } : null;
+        }
+
+        function draw() {
+          if (!worldImage.complete || worldImage.naturalWidth === 0) {
+            requestAnimationFrame(draw);
+            return;
+          }
+
+          computeViewport();
+
+          // Clear
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+          // Draw world sub-rect corresponding to viewport
+          const sWidth = Math.min(canvas.width, worldImage.naturalWidth - state.viewport.x);
+          const sHeight = Math.min(canvas.height, worldImage.naturalHeight - state.viewport.y);
+          ctx.drawImage(
+            worldImage,
+            state.viewport.x,
+            state.viewport.y,
+            sWidth,
+            sHeight,
+            0,
+            0,
+            sWidth,
+            sHeight
+          );
+
+          // Draw all players
+          Object.values(state.players).forEach(player => {
+            const playerScreenX = Math.floor(player.x - state.viewport.x);
+            const playerScreenY = Math.floor(player.y - state.viewport.y);
+
+            // Skip if player is outside viewport
+            if (playerScreenX < -100 || playerScreenX > canvas.width + 100 || 
+                playerScreenY < -100 || playerScreenY > canvas.height + 100) {
+              return;
+            }
+
+            const frameData = selectAvatarFrame(player);
+            // Debug logging
+            if (!frameData) {
+              console.log('No frame data for player:', player.username, 'avatarKey:', player.avatarKey, 'facing:', player.facing);
+            } else if (!frameData.img) {
+              console.log('No image in frame data for player:', player.username);
+            } else if (!frameData.img.complete) {
+              console.log('Image not complete for player:', player.username);
+            }
+            
+            if (frameData && frameData.img && frameData.img.complete && frameData.img.naturalWidth) {
+              const imgW = frameData.img.naturalWidth;
+              const imgH = frameData.img.naturalHeight;
+              const dx = Math.round(playerScreenX - Math.floor(imgW / 2));
+              const dy = Math.round(playerScreenY - Math.floor(imgH / 2));
+              
+              if (frameData.shouldFlip) {
+                // Flip horizontally for west-facing sprites
+                ctx.save();
+                ctx.scale(-1, 1);
+                ctx.drawImage(frameData.img, -dx - imgW, dy);
+                ctx.restore();
+              } else {
+                ctx.drawImage(frameData.img, dx, dy);
+              }
+              drawLabel(player.username, playerScreenX, dy);
+            } else {
+              // Fallback: simple placeholder
+              const size = 24;
+              const dx = Math.round(playerScreenX - size / 2);
+              const dy = Math.round(playerScreenY - size / 2);
+              ctx.fillStyle = '#ffcc00';
+              ctx.fillRect(dx, dy, size, size);
+              drawLabel(player.username, playerScreenX, dy);
+            }
+          });
+
+          requestAnimationFrame(draw);
+        }
+
+        function sendMoveCommand(direction) {
+          if (socket && socket.readyState === WebSocket.OPEN) {
+            const moveMsg = { action: 'move', direction: direction };
+            socket.send(JSON.stringify(moveMsg));
+          }
+        }
+
+        function handleKeyDown(event) {
+          const key = event.key;
+          if (activeKeys.has(key)) return; // Already pressed
+          
+          activeKeys.add(key);
+          event.preventDefault(); // Prevent page scrolling
+        }
+
+        function handleKeyUp(event) {
+          const key = event.key;
+          activeKeys.delete(key);
+        }
+
+        function processMovement() {
+          if (activeKeys.size === 0) return;
+          
+          // Send move command for the first active key (prioritize first pressed)
+          const firstKey = activeKeys.values().next().value;
+          switch (firstKey) {
+            case 'ArrowUp':
+              sendMoveCommand('up');
+              break;
+            case 'ArrowDown':
+              sendMoveCommand('down');
+              break;
+            case 'ArrowLeft':
+              sendMoveCommand('left');
+              break;
+            case 'ArrowRight':
+              sendMoveCommand('right');
+              break;
+          }
+        }
+
+        function init() {
+          resizeCanvas();
+          connect();
+          requestAnimationFrame(draw);
+          
+          // Add keyboard event listeners
+          document.addEventListener('keydown', handleKeyDown);
+          document.addEventListener('keyup', handleKeyUp);
+          
+          // Movement loop - send commands at ~10fps for reasonable speed
+          setInterval(processMovement, 100); // ~10fps
+          
+          // Clear active keys when window loses focus
+          window.addEventListener('blur', function() {
+            activeKeys.clear();
+          });
+        }
+
+        worldImage.addEventListener('load', function () {
+          // world loaded; we already draw in the RAF loop
+        });
+
+        window.addEventListener('resize', function () {
+          resizeCanvas();
+        });
+
+        // Kickoff
+        init();
+      })();
+    </script>
+  </body>
+</html>
+
+
+
